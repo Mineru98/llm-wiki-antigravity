@@ -34,6 +34,14 @@ This project uses a standalone wiki implementation. Run commands from the reposi
 ./.agents/workflows/wiki.sh wiki_lint --json
 ```
 
+### Encoding Validation
+
+The PowerShell entry point reads and writes wiki pages as UTF-8, validates title,
+content, and tags for common mojibake before saving, and repairs the common
+UTF-8-decoded-as-Windows-1252 form when it can do so safely. Run
+`wiki_lint -Json` after bulk edits to detect invalid UTF-8 files, Unicode replacement
+characters, or likely UTF-8 mojibake.
+
 ### Quick Add
 ```powershell
 .\.agents\workflows\wiki.ps1 wiki_add -InputJson '{"title":"Page Title","content":"...","tags":["tag1"],"category":"decision"}' -Json

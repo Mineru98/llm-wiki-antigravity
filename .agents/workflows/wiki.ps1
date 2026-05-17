@@ -14,6 +14,15 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $Categories = @('architecture', 'decision', 'pattern', 'debugging', 'environment', 'session-log', 'reference', 'convention')
+$Utf8Strict = New-Object System.Text.UTF8Encoding($false, $true)
+
+try {
+    [Console]::InputEncoding = [System.Text.Encoding]::UTF8
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+}
+catch {
+    # Some hosts do not expose mutable console encodings.
+}
 
 function Resolve-WikiRoot {
     $current = (Resolve-Path $PSScriptRoot).Path
@@ -41,6 +50,97 @@ function ConvertFrom-InputJson {
     param([string] $Value)
     if ([string]::IsNullOrWhiteSpace($Value)) { return [pscustomobject]@{} }
     return $Value | ConvertFrom-Json
+}
+
+function Get-Windows1252Encoding {
+    try {
+        $providerType = [type]'System.Text.CodePagesEncodingProvider'
+        if ($providerType) {
+            [System.Text.Encoding]::RegisterProvider($providerType::Instance)
+        }
+    }
+    catch {
+    }
+
+    return [System.Text.Encoding]::GetEncoding(1252)
+}
+
+function Get-MojibakeScore {
+    param([string] $Text)
+    if ([string]::IsNullOrEmpty($Text)) { return 0 }
+
+    $suspicious = @(
+        0x00C2, 0x00C3, 0x00E2, 0x20AC, 0x00ED, 0x00EC,
+        0x00EA, 0x00EB, 0x0153, 0x00AA, 0x00A9, 0x00A7,
+        0x00A8, 0x201E, 0xFFFD
+    )
+    $score = 0
+    foreach ($char in $Text.ToCharArray()) {
+        if ([int][char]$char -in $suspicious) {
+            $score += 1
+        }
+    }
+    return $score
+}
+
+function Repair-TextEncoding {
+    param([AllowNull()][string] $Text)
+    if ($null -eq $Text -or $Text -eq '') { return $Text }
+
+    $originalScore = Get-MojibakeScore $Text
+    if ($originalScore -eq 0) { return $Text }
+
+    try {
+        $bytes = (Get-Windows1252Encoding).GetBytes($Text)
+        $candidate = [System.Text.Encoding]::UTF8.GetString($bytes)
+    }
+    catch {
+        return $Text
+    }
+
+    if ($candidate -eq $Text -or $candidate.Contains([char]0xFFFD)) {
+        return $Text
+    }
+
+    $candidateScore = Get-MojibakeScore $candidate
+    $originalHasHangul = $Text -match '\p{IsHangulSyllables}|\p{IsHangulJamo}|\p{IsHangulCompatibilityJamo}'
+    $candidateHasHangul = $candidate -match '\p{IsHangulSyllables}|\p{IsHangulJamo}|\p{IsHangulCompatibilityJamo}'
+
+    if (($candidateHasHangul -and -not $originalHasHangul) -or $candidateScore -lt $originalScore) {
+        return $candidate
+    }
+
+    return $Text
+}
+
+function Test-TextEncodingHealth {
+    param([AllowNull()][string] $Text)
+    if ([string]::IsNullOrEmpty($Text)) { return @() }
+
+    $issues = @()
+    if ($Text.Contains([char]0xFFFD)) {
+        $issues += 'contains Unicode replacement character'
+    }
+    $koreanReplacementMojibake = [string]::Concat([char]0x5360, [char]0xC3D9, [char]0xC639)
+    if ($Text.Contains($koreanReplacementMojibake)) {
+        $issues += 'contains common Korean replacement mojibake'
+    }
+    if ((Get-MojibakeScore $Text) -ge 2) {
+        $issues += 'contains likely UTF-8 mojibake'
+    }
+    return @($issues)
+}
+
+function Assert-HealthyTextEncoding {
+    param(
+        [string] $Field,
+        [AllowNull()][string] $Text
+    )
+
+    $issues = @(Test-TextEncodingHealth $Text)
+    if ($issues.Count -gt 0) {
+        throw "encoding validation failed for ${Field}: $($issues -join '; ')"
+    }
 }
 
 function ConvertTo-Slug {
@@ -88,7 +188,7 @@ function Get-PageFiles {
 function Read-WikiPage {
     param([System.IO.FileInfo] $File)
 
-    $text = Get-Content -Raw -LiteralPath $File.FullName
+    $text = Get-Content -Raw -LiteralPath $File.FullName -Encoding UTF8
     $metadata = [ordered]@{
         title = [IO.Path]::GetFileNameWithoutExtension($File.Name)
         slug = [IO.Path]::GetFileNameWithoutExtension($File.Name)
@@ -178,11 +278,23 @@ function Write-WikiPage {
     )
 
     Ensure-Wiki
+    $Title = Repair-TextEncoding $Title
+    $Content = Repair-TextEncoding $Content
+    $Tags = @($Tags | ForEach-Object { Repair-TextEncoding "$_" })
+    $Category = Repair-TextEncoding $Category
+    $Slug = Repair-TextEncoding $Slug
+
     if ([string]::IsNullOrWhiteSpace($Title)) { throw 'title is required' }
     if ([string]::IsNullOrWhiteSpace($Content)) { throw 'content is required' }
     if ([string]::IsNullOrWhiteSpace($Category)) { $Category = 'reference' }
     if ($Category -notin $Categories) { throw "invalid category '$Category'. Allowed: $($Categories -join ', ')" }
     if ([string]::IsNullOrWhiteSpace($Slug)) { $Slug = ConvertTo-Slug $Title }
+
+    Assert-HealthyTextEncoding -Field 'title' -Text $Title
+    Assert-HealthyTextEncoding -Field 'content' -Text $Content
+    foreach ($tag in $Tags) {
+        Assert-HealthyTextEncoding -Field 'tag' -Text $tag
+    }
 
     $path = Get-WikiPath "$Slug.md"
     $now = (Get-Date).ToUniversalTime().ToString('o')
@@ -272,9 +384,30 @@ function Test-Wiki {
     $slugs = @{}
     $pages = @(Get-PageFiles | ForEach-Object { Read-WikiPage $_ })
 
+    foreach ($file in @(Get-PageFiles)) {
+        try {
+            $bytes = [System.IO.File]::ReadAllBytes($file.FullName)
+            [void]$Utf8Strict.GetString($bytes)
+        }
+        catch {
+            $issues += [pscustomobject]@{ page = [IO.Path]::GetFileNameWithoutExtension($file.Name); severity = 'error'; message = 'file is not valid UTF-8' }
+        }
+    }
+
     foreach ($page in $pages) {
         if ([string]::IsNullOrWhiteSpace($page.title)) {
             $issues += [pscustomobject]@{ page = $page.slug; severity = 'error'; message = 'missing title' }
+        }
+        foreach ($encodingIssue in @(Test-TextEncodingHealth $page.title)) {
+            $issues += [pscustomobject]@{ page = $page.slug; severity = 'error'; message = "title encoding issue: $encodingIssue" }
+        }
+        foreach ($encodingIssue in @(Test-TextEncodingHealth $page.content)) {
+            $issues += [pscustomobject]@{ page = $page.slug; severity = 'error'; message = "content encoding issue: $encodingIssue" }
+        }
+        foreach ($tag in @($page.tags)) {
+            foreach ($encodingIssue in @(Test-TextEncodingHealth $tag)) {
+                $issues += [pscustomobject]@{ page = $page.slug; severity = 'error'; message = "tag encoding issue: $encodingIssue" }
+            }
         }
         if ($page.category -and $page.category -notin $Categories) {
             $issues += [pscustomobject]@{ page = $page.slug; severity = 'error'; message = "invalid category '$($page.category)'" }

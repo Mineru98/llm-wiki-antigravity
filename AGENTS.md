@@ -76,6 +76,9 @@ Route wiki requests as follows:
 - Add or update knowledge: run `.\.agents\workflows\wiki.ps1 wiki_add -InputJson '{"title":"Title","content":"...","tags":["tag"],"category":"decision"}' -Json`.
 - Ingest structured project notes: run `.\.agents\workflows\wiki.ps1 wiki_ingest -InputJson '{"title":"Title","content":"...","tags":["tag"],"category":"reference"}' -Json`.
 - Validate wiki health after edits: run `.\.agents\workflows\wiki.ps1 wiki_lint -Json`.
+- When adding or updating Korean text from PowerShell, rely on the PowerShell
+  workflow's UTF-8 validation and mojibake repair, then run `wiki_lint -Json`
+  before reporting the wiki update as complete.
 
 Wiki content is stored under `.wiki/`:
 
